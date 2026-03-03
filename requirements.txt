@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-camoufox
-playwright
 httpx
 python-multipart
+cloudscraper>=1.2.71
+curl_cffi>=0.7

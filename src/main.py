@@ -54,6 +54,8 @@ from .recaptcha import (
     refresh_recaptcha_token,
     get_cached_recaptcha_token,
 )
+from .flaresolverr_client import flaresolverr_client
+from .cloudscraper_client import cloudscraper_client
 from .auth import (
     _combine_split_arena_auth_cookies,
     _capture_ephemeral_arena_auth_token_from_cookies,
@@ -79,27 +81,9 @@ from .auth import (
 
 from .transport import (
     BrowserFetchStreamResponse,
-    UserscriptProxyStreamResponse,
-    _touch_userscript_poll,
-    _get_userscript_proxy_queue,
-    _userscript_proxy_is_active,
-    _userscript_proxy_check_secret,
-    _cleanup_userscript_proxy_jobs,
-    _mark_userscript_proxy_inactive,
-    _finalize_userscript_proxy_job,
-    _detect_arena_origin,
-    _arena_origin_candidates,
-    _arena_auth_cookie_specs,
-    _provisional_user_id_cookie_specs,
-    _get_arena_context_cookies,
-    _normalize_userscript_proxy_url,
-    fetch_lmarena_stream_via_userscript_proxy,
-    fetch_lmarena_stream_via_chrome,
-    fetch_lmarena_stream_via_camoufox,
-    fetch_via_proxy_queue,
-    push_proxy_chunk,
-    camoufox_proxy_worker,
+    fetch_lmarena_stream_via_flaresolverr,
 )
+
 
 # Aliases for backward compatibility
 DEBUG = constants.DEBUG
@@ -232,7 +216,7 @@ def log_http_status(status_code: int, context: str = "") -> None:
 
 # Updated constants from gpt4free/g4f/Provider/needs_auth/LMArena.py
 RECAPTCHA_SITEKEY = "6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I"
-RECAPTCHA_ACTION = "chat_submit"
+RECAPTCHA_ACTION = "sign_up"
 # reCAPTCHA Enterprise v2 sitekey used when v3 scoring fails and LMArena prompts a checkbox challenge.
 RECAPTCHA_V2_SITEKEY = "6Ld7ePYrAAAAAB34ovoFoDau1fqCJ6IyOjFEQaMn"
 # Cloudflare Turnstile sitekey used by LMArena to mint anonymous-user signup tokens.
@@ -309,13 +293,13 @@ async def upload_image_to_lmarena(image_data: bytes, mime_type: str, filename: s
             "Accept": "text/x-component",
             "Content-Type": "text/plain;charset=UTF-8",
             "Next-Action": upload_action_id,
-            "Referer": "https://lmarena.ai/?mode=direct",
+            "Referer": "https://arena.ai/?mode=direct",
         })
         
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.post(
-                    "https://lmarena.ai/?mode=direct",
+                    "https://arena.ai/?mode=direct",
                     headers=request_headers,
                     content=json.dumps([filename, mime_type]),
                     timeout=30.0
@@ -373,7 +357,7 @@ async def upload_image_to_lmarena(image_data: bytes, mime_type: str, filename: s
             
             try:
                 response = await client.post(
-                    "https://lmarena.ai/?mode=direct",
+                    "https://arena.ai/?mode=direct",
                     headers=request_headers_step3,
                     content=json.dumps([key]),
                     timeout=30.0
@@ -547,13 +531,84 @@ async def process_message_content(content, model_capabilities: dict) -> tuple[st
     # Fallback
     return str(content), []
 
+
+def _apply_fetched_cookies(cookies: dict, ua: str | None, source: str) -> bool:
+    """Apply fetched cookies from any source (cloudscraper or FlareSolverr) into config."""
+    cfg = get_config()
+    updated = False
+
+    for key in ("cf_clearance", "provisional_user_id", "__cf_bm", "user_country_code"):
+        if key in cookies and cfg.get(key) != cookies[key]:
+            cfg[key] = cookies[key]
+            updated = True
+
+    if ua and cfg.get("user_agent") != ua:
+        cfg["user_agent"] = ua
+        updated = True
+
+    if "arena-auth-prod-v1" in cookies:
+        new_token = cookies["arena-auth-prod-v1"]
+        tokens = cfg.get("auth_tokens", [])
+        if new_token not in tokens:
+            tokens.insert(0, new_token)
+            cfg["auth_tokens"] = tokens
+            updated = True
+
+    if updated:
+        save_config(cfg)
+        debug_print(f"✅ {source} cookies saved to config!")
+    return updated
+
+
+async def cookie_worker():
+    """Background task: fetch cookies via cloudscraper (primary) or FlareSolverr (fallback)."""
+    debug_print("🚀 Starting cookie worker (cloudscraper primary, FlareSolverr fallback)...")
+    while True:
+        # --- Primary: cloudscraper (no Docker needed) ---
+        try:
+            success = await cloudscraper_client.fetch_clearance(
+                target_url="https://arena.ai/?mode=direct", timeout_ms=60000
+            )
+            if success:
+                cookies = cloudscraper_client.get_cookies()
+                ua = cloudscraper_client.get_user_agent()
+                _apply_fetched_cookies(cookies, ua, "Cloudscraper")
+                await asyncio.sleep(600)  # 10 min
+                continue
+            else:
+                debug_print("⚠️ Cloudscraper fetch returned False, trying FlareSolverr...")
+        except Exception as e:
+            debug_print(f"⚠️ Cloudscraper error: {e}, trying FlareSolverr...")
+
+        # --- Fallback: FlareSolverr (Docker) ---
+        try:
+            success = await flaresolverr_client.fetch_clearance(
+                target_url="https://arena.ai/?mode=direct", timeout_ms=60000
+            )
+            if success:
+                cookies = flaresolverr_client.get_cookies()
+                ua = flaresolverr_client.get_user_agent()
+                _apply_fetched_cookies(cookies, ua, "FlareSolverr")
+            else:
+                debug_print("⚠️ FlareSolverr also returned False.")
+        except Exception as e:
+            debug_print(f"⚠️ FlareSolverr also failed: {e}")
+
+        await asyncio.sleep(600)  # 10 min
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Start the cookie worker (cloudscraper primary, FlareSolverr fallback)
+    worker_task = asyncio.create_task(cookie_worker())
     try:
         await startup_event()
     except Exception as e:
         debug_print(f"❌ Error during startup: {e}")
     yield
+    try:
+        worker_task.cancel()
+    except Exception as e:
+        pass
 
 app = FastAPI(lifespan=lifespan)
 
@@ -735,10 +790,48 @@ async def rate_limit_api_key(key: str = Depends(API_KEY_HEADER)):
 
 async def get_initial_data():
     debug_print("Starting initial data retrieval...")
+    
+    # If we already have cached models and reCAPTCHA params, skip the heavy Camoufox browser init.
+    # FlareSolverr handles cookies independently, and Cloudflare Turnstile consistently blocks 
+    # Camoufox on arena.ai, causing a 120s startup hang.
+    cfg = get_config()
+    cached_models = cfg.get("models", [])
+    cached_sitekey = cfg.get("recaptcha_sitekey", "")
+    if cached_models and len(cached_models) > 10 and cached_sitekey:
+        debug_print(f"✅ Using cached data: {len(cached_models)} models, sitekey={str(cached_sitekey)[:20]}...")
+        debug_print("   Skipping Camoufox browser init (FlareSolverr handles cookies)")
+        debug_print("✅ Initial data retrieval complete")
+        return
+    
     try:
-        async with AsyncCamoufox(headless=True, main_world_eval=True) as browser:
-            page = await browser.new_page()
+        # Use FlareSolverr's User-Agent to ensure Cloudflare/Google consistency
+        ua = cfg.get("user_agent")
+        async with AsyncCamoufox(
+            headless=True, 
+            main_world_eval=True
+        ) as browser:
+            # bypass_csp is CRITICAL for our script injection strategy
+            page = await browser.new_page(bypass_csp=True, user_agent=ua)
             
+            # Detailed console logging for startup
+            page.on("console", lambda msg: debug_print(f"    [Camoufox Console] {msg.text}"))
+            page.on("requestfailed", lambda request: debug_print(f"    [Camoufox Net] Failed: {request.url} - {request.failure.error_text}"))
+            # Inject existing FlareSolverr cookies to help bypass Cloudflare immediately
+            from .flaresolverr_client import flaresolverr_client as _fsc
+            fs_cookies = _fsc.get_cookies()
+            if fs_cookies:
+                pw_cookies = []
+                for cname, cval in fs_cookies.items():
+                    pw_cookies.append({
+                        "name": cname,
+                        "value": cval,
+                        "domain": ".arena.ai",
+                        "path": "/",
+                        "secure": True,
+                        "sameSite": "Lax"
+                    })
+                await page.context.add_cookies(pw_cookies)
+                debug_print(f"  🍪 Injected {len(pw_cookies)} FlareSolverr cookies for startup bypass")
             # Set up route interceptor BEFORE navigating
             debug_print("  🎯 Setting up route interceptor for JS chunks...")
             captured_responses = []
@@ -770,8 +863,8 @@ async def get_initial_data():
             # Register the route interceptor
             await page.route('**/*', capture_js_route)
             
-            debug_print("Navigating to lmarena.ai...")
-            await page.goto("https://lmarena.ai/", wait_until="domcontentloaded")
+            debug_print("Navigating to arena.ai...")
+            await page.goto("https://arena.ai/", wait_until="domcontentloaded")
 
             debug_print("Waiting for Cloudflare challenge to complete...")
             challenge_passed = False
@@ -1001,9 +1094,118 @@ async def get_initial_data():
                         discovered_key = extract_supabase_anon_key_from_text(page_body)
                     if discovered_key:
                         SUPABASE_ANON_KEY = discovered_key
-                        debug_print(f"✅ Discovered Supabase anon key: {discovered_key[:16]}...")
+                    debug_print(f"✅ Discovered Supabase anon key: {discovered_key[:16]}...")
             except Exception:
                 pass
+
+            # Mint a reCAPTCHA token while we still have a browser on arena.ai
+            debug_print("\n🔐 Minting reCAPTCHA token during startup browser session...")
+            try:
+                rc_sitekey = str(config.get("recaptcha_sitekey", "") or RECAPTCHA_SITEKEY or "").strip()
+                rc_action = str(config.get("recaptcha_action", "") or RECAPTCHA_ACTION or "sign_up").strip()
+                
+                if rc_sitekey:
+                    # Strategy 3 (PROVEN): fetch the stub and eval it
+                    # This is the most reliable way to inject into the main world in Camoufox
+                    script_url = f"https://www.google.com/recaptcha/enterprise.js?render={rc_sitekey}"
+                    debug_print(f"  📜 Injecting reCAPTCHA script via fetch+eval...")
+                    
+                    inject_js = f"""
+                        (async () => {{
+                            try {{
+                                const script = document.createElement('script');
+                                script.src = '{script_url}';
+                                script.async = true;
+                                script.defer = true;
+                                script.id = 'recaptcha-injected';
+                                document.head.appendChild(script);
+                                return 'injected_ok';
+                            }} catch (e) {{
+                                return 'error_' + e.message;
+                            }}
+                        }})()
+                    """
+                    init_res = await page.evaluate(inject_js)
+                    debug_print(f"  📄 Injection result: {{init_res}}")
+                    
+                    # Wait for grecaptcha.enterprise to become available
+                    rc_ready = False
+                    for attempt in range(15):
+                        rc_ready = await page.evaluate(
+                            "typeof (window.wrappedJSObject || window).grecaptcha !== 'undefined' && typeof (window.wrappedJSObject || window).grecaptcha.enterprise !== 'undefined'"
+                        )
+                        if rc_ready:
+                            break
+                        await asyncio.sleep(1)
+                    
+                    if rc_ready:
+                        debug_print("  ✅ grecaptcha.enterprise loaded. Executing...")
+                        
+                        # Execute reCAPTCHA with a robust timeout and fallback
+                        js_code = f"""
+                        new Promise((resolve) => {{
+                            // Fallback timeout
+                            const timer = setTimeout(() => resolve("TOKEN_EXECUTION_TIMEOUT"), 60000);
+                            const w = window.wrappedJSObject || window;
+                            
+                            const runExecute = async () => {{
+                                try {{
+                                    console.log("reCAPTCHA: Starting execute('{rc_sitekey}', '{rc_action}')...");
+                                    const params = new w.Object();
+                                    params.action = '{rc_action}';
+                                    const token = await w.grecaptcha.enterprise.execute('{rc_sitekey}', params);
+                                    console.log("reCAPTCHA: Execute succeeded, token length: " + (token ? token.length : 0));
+                                    clearTimeout(timer);
+                                    resolve(token);
+                                }} catch (e) {{
+                                    console.error("reCAPTCHA: Execute error: " + e.message);
+                                    clearTimeout(timer);
+                                    resolve("EXECUTE_ERROR: " + (e.message || String(e)));
+                                }}
+                            }};
+
+                            try {{
+                                let readyFired = false;
+                                console.log("reCAPTCHA: Registering ready() callback...");
+                                w.grecaptcha.enterprise.ready(() => {{
+                                    if (readyFired) return;
+                                    readyFired = true;
+                                    console.log("reCAPTCHA: ready() callback fired.");
+                                    runExecute();
+                                }});
+
+                                // Fallback if ready() hangs
+                                setTimeout(() => {{
+                                    if (!readyFired) {{
+                                        console.warn("reCAPTCHA: ready() callback hung, attempting direct execute...");
+                                        runExecute();
+                                    }}
+                                }}, 10000);
+                            }} catch (globalError) {{
+                                console.error("reCAPTCHA: Global promise error: " + globalError.message);
+                                resolve("GLOBAL_ERROR: " + globalError.message);
+                            }}
+                        }})
+                        """
+                        try:
+                            token_result = await page.evaluate(js_code)
+                        except Exception as e:
+                            debug_print(f"❌ reCAPTCHA evaluate error: {e}")
+                            token_result = None # Ensure token_result is set to None on error
+
+                        if token_result and isinstance(token_result, str) and len(token_result) > 50:
+                            from datetime import timezone
+                            RECAPTCHA_TOKEN = token_result
+                            RECAPTCHA_EXPIRY = datetime.now(timezone.utc) + timedelta(seconds=110)
+                            debug_print(f"  ✅ Got startup reCAPTCHA token: {token_result[:30]}...")
+                        else:
+                            debug_print(f"  ❌ Failed to get startup reCAPTCHA token: {token_result}")
+                    else:
+                        debug_print("  ❌ grecaptcha.enterprise not available after script injection.")
+                else:
+                    debug_print("  ⚠️ No sitekey found; skipping reCAPTCHA minting")
+            except Exception as e:
+                debug_print(f"  ❌ reCAPTCHA startup minting error: {e}")
 
             debug_print("✅ Initial data retrieval complete")
     except Exception as e:
@@ -1076,7 +1278,6 @@ async def startup_event():
         last_userscript_poll = now
         USERSCRIPT_PROXY_LAST_POLL_AT = now
         
-        asyncio.create_task(camoufox_proxy_worker())
         
     except Exception as e:
         debug_print(f"❌ Error during startup: {e}")
@@ -2342,12 +2543,10 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             else:
                 recaptcha_token = await refresh_recaptcha_token(force_new=False)
                 if not recaptcha_token:
-                    debug_print("❌ Cannot proceed, failed to get reCAPTCHA token.")
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Service Unavailable: Failed to acquire reCAPTCHA token. The bridge server may be blocked."
-                    )
-                debug_print(f"🔑 Using reCAPTCHA v3 token: {recaptcha_token[:20]}...")
+                    debug_print("⚠️ No reCAPTCHA token available — proceeding without it (may get 403).")
+                    recaptcha_token = ""
+                else:
+                    debug_print(f"🔑 Using reCAPTCHA v3 token: {recaptcha_token[:20]}...")
         # -----------------------------------------------
         
         # Generate conversation ID from context (API key + model + first user message)
@@ -2392,7 +2591,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             # Use LMArena's retry endpoint
             # Format: PUT /nextjs-api/stream/retry-evaluation-session-message/{sessionId}/messages/{messageId}
             payload = {}
-            url = f"https://lmarena.ai/nextjs-api/stream/retry-evaluation-session-message/{session['conversation_id']}/messages/{retry_message_id}"
+            url = f"{LMARENA_ORIGIN}/nextjs-api/stream/retry-evaluation-session-message/{session['conversation_id']}/messages/{retry_message_id}"
             debug_print(f"📤 Target URL: {url}")
             debug_print(f"📦 Using PUT method for retry")
             http_method = "PUT"
@@ -2424,7 +2623,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 "modality": modality,
                 "recaptchaV3Token": recaptcha_token, # <--- ADD TOKEN HERE
             }
-            url = f"https://lmarena.ai{STREAM_CREATE_EVALUATION_PATH}"
+            url = f"{LMARENA_ORIGIN}{STREAM_CREATE_EVALUATION_PATH}"
             debug_print(f"📤 Target URL: {url}")
             debug_print(f"📦 Payload structure: Simple userMessage format")
             debug_print(f"🔍 Full payload: {json.dumps(payload, indent=2)}")
@@ -2453,7 +2652,7 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                 "modality": modality,
                 "recaptchaV3Token": recaptcha_token, # <--- ADD TOKEN HERE
             }
-            url = f"https://lmarena.ai/nextjs-api/stream/post-to-evaluation/{session['conversation_id']}"
+            url = f"{LMARENA_ORIGIN}/nextjs-api/stream/post-to-evaluation/{session['conversation_id']}"
             debug_print(f"📤 Target URL: {url}")
             debug_print(f"📦 Payload structure: Simple userMessage format")
             debug_print(f"🔍 Full payload: {json.dumps(payload, indent=2)}")
@@ -2533,7 +2732,8 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             
             for attempt in range(max_retries):
                 try:
-                    async with httpx.AsyncClient() as client:
+                    from curl_cffi.requests import AsyncSession
+                    async with AsyncSession(impersonate="firefox133") as client:
                         if http_method == "PUT":
                             response = await client.put(url, json=payload, headers=headers, timeout=120)
                         else:
@@ -2599,16 +2799,20 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     break
                         
                         # If we get here, return the response (success or non-retryable error)
-                        response.raise_for_status()
+                        if response.status_code >= 400:
+                            if response.status_code not in [401, 429] or attempt == max_retries - 1:
+                                try:
+                                    detail = response.json()
+                                except Exception:
+                                    detail = response.text
+                                raise HTTPException(status_code=response.status_code, detail=detail)
                         return response
                         
-                except httpx.HTTPStatusError as e:
-                    # Only handle 429 and 401, let other errors through
-                    if e.response.status_code not in [429, 401]:
+                except Exception as e:
+                    if isinstance(e, HTTPException):
                         raise
-                    # If last attempt, raise the error
                     if attempt == max_retries - 1:
-                        raise
+                        raise HTTPException(status_code=500, detail=f"Upstream request failed: {str(e)}")
             
             # Should not reach here, but just in case
             raise HTTPException(status_code=503, detail="Max retries exceeded")
@@ -2647,31 +2851,10 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                         yield ": keep-alive\n\n"
                         await asyncio.sleep(min(1.0, end_time - time.time()))
 
-                # Use browser transports (Userscript proxy / Chrome/Camoufox) proactively for:
-                #   - models known to be strict with reCAPTCHA
-                #   - any streaming request when no auth token is available (browser session may be able to sign up / reuse cookies)
-                disable_userscript_proxy_env = bool(os.environ.get("LM_BRIDGE_DISABLE_USERSCRIPT_PROXY"))
-                proxy_active_at_start = False
-                if not disable_userscript_proxy_env:
-                    try:
-                        proxy_active_at_start = _userscript_proxy_is_active()
-                    except Exception:
-                        proxy_active_at_start = False
-
-                # If the userscript proxy is active (internal Camoufox worker / extension poller), route streaming
-                # through it immediately to avoid side-channel reCAPTCHA token minting (which can launch headful Chrome).
-                use_browser_transports = (
-                    force_browser_transports_in_stream
-                    or (model_public_name in STRICT_CHROME_FETCH_MODELS)
-                    or proxy_active_at_start
-                )
-                prefer_chrome_transport = True
-                if use_browser_transports and (model_public_name in STRICT_CHROME_FETCH_MODELS):
-                    debug_print(f"🔐 Strict model detected ({model_public_name}), enabling browser fetch transport.")
-                elif use_browser_transports and force_browser_transports_in_stream:
-                    debug_print("⚠️ Stream mode without auth token: preferring userscript proxy / browser fetch transports.")
-                elif use_browser_transports and proxy_active_at_start:
-                    debug_print("🦊 Userscript proxy is ACTIVE: routing stream through proxy and skipping side-channel reCAPTCHA mint.")
+                # FlareSolverr migration: browser transports (Userscript proxy, Chrome, Camoufox) are fully
+                # replaced by FlareSolverr + httpx.  Force-disable all legacy browser transport logic.
+                use_browser_transports = False
+                use_userscript = False
 
                 # Non-strict models: mint a fresh side-channel token before the first upstream attempt so we don't
                 # send an empty `recaptchaV3Token` (which commonly yields 403 "recaptcha validation failed").
@@ -2738,97 +2921,6 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             debug_print(f"📡 Sending {http_method} request for streaming (attempt {attempt})...")
                             stream_context = None
                             transport_used = "httpx"
-                            
-                            # Prefer the userscript proxy only when it is actually polling (or when a poller connects
-                            # shortly after the request starts). This avoids hanging strict-model requests when no
-                            # proxy is running, while still supporting "late" pollers (tests/reconnects).
-                            use_userscript = False
-                            cfg_now = None
-                            if (
-                                use_browser_transports
-                                and not disable_userscript_for_request
-                                and not disable_userscript_proxy_env
-                            ):
-                                try:
-                                    cfg_now = get_config()
-                                except Exception:
-                                    cfg_now = None
-
-                                try:
-                                    proxy_active = _userscript_proxy_is_active(cfg_now)
-                                except Exception:
-                                    proxy_active = False
-
-                                if not proxy_active:
-                                    try:
-                                        grace_seconds = float((cfg_now or {}).get("userscript_proxy_grace_seconds", 0.5))
-                                    except Exception:
-                                        grace_seconds = 0.5
-                                    grace_seconds = max(0.0, min(grace_seconds, 2.0))
-                                    if grace_seconds > 0:
-                                        deadline = time.time() + grace_seconds
-                                        while time.time() < deadline:
-                                            try:
-                                                if _userscript_proxy_is_active(cfg_now):
-                                                    proxy_active = True
-                                                    break
-                                            except Exception:
-                                                pass
-                                            yield ": keep-alive\n\n"
-                                            await asyncio.sleep(0.05)
-
-                                if proxy_active:
-                                    use_userscript = True
-                                    debug_print("🌐 Userscript Proxy is ACTIVE. Preferring Proxy over direct/Chrome fetch.")
-                                # Default behavior: mint in-page (higher success rate than side-channel cached tokens).
-                                # Optional: allow pre-filling a cached token for speed via config flag.
-                                try:
-                                    prefill_cached = bool((cfg_now or {}).get("userscript_proxy_prefill_cached_recaptcha", False))
-                                except Exception:
-                                    prefill_cached = False
-                                if (
-                                    prefill_cached
-                                    and isinstance(payload, dict)
-                                    and not force_proxy_recaptcha_mint
-                                    and not str(payload.get("recaptchaV3Token") or "").strip()
-                                ):
-                                    try:
-                                        cached = get_cached_recaptcha_token()
-                                    except Exception:
-                                        cached = ""
-                                    if cached:
-                                        debug_print(f"🔐 Using cached reCAPTCHA v3 token for proxy (len={len(str(cached))})")
-                                        payload["recaptchaV3Token"] = cached
-
-                            if use_userscript:
-                                debug_print(
-                                    f"📫 Delegating request to Userscript Proxy (poll active {int(time.time() - last_userscript_poll)}s ago)..."
-                                )
-                                proxy_auth_token = str(current_token or "").strip()
-                                try:
-                                    # Preserve expired base64 Supabase session cookies: they can often be refreshed
-                                    # in-page via their embedded refresh_token (no user interaction).
-                                    if (
-                                        proxy_auth_token
-                                        and not str(proxy_auth_token).startswith("base64-")
-                                        and is_arena_auth_token_expired(proxy_auth_token, skew_seconds=0)
-                                    ):
-                                        proxy_auth_token = ""
-                                except Exception:
-                                    pass
-                                stream_context = await fetch_via_proxy_queue(
-                                    url=url,
-                                    payload=payload if isinstance(payload, dict) else {},
-                                    http_method=http_method,
-                                    timeout_seconds=120,
-                                    streaming=True,
-                                    auth_token=proxy_auth_token,
-                                )
-                                if stream_context is None:
-                                    debug_print("⚠️ Userscript Proxy returned None (timeout?). Falling back...")
-                                    use_userscript = False
-                                else:
-                                    transport_used = "userscript"
 
                             # Strict models: when we're about to fall back to buffered browser fetch transports (not the
                             # streaming proxy), a side-channel token can avoid hangs while grecaptcha loads in-page.
@@ -2858,175 +2950,21 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                                     if new_token:
                                         payload["recaptchaV3Token"] = new_token
 
-                            if stream_context is None and use_browser_transports:
-                                browser_fetch_attempts = 5
-                                try:
-                                    browser_fetch_attempts = int(get_config().get("chrome_fetch_recaptcha_max_attempts", 5))
-                                except Exception:
-                                    browser_fetch_attempts = 5
-
-                                # If we have a cached side-channel reCAPTCHA token, prefer passing it into the browser
-                                # fetch transports (they will reuse it on the first attempt and only mint in-page if
-                                # needed). This helps when in-page grecaptcha is slow/flaky.
-                                if isinstance(payload, dict) and not str(payload.get("recaptchaV3Token") or "").strip():
-                                    try:
-                                        cached_token = get_cached_recaptcha_token()
-                                    except Exception:
-                                        cached_token = ""
-                                    if cached_token:
-                                        payload["recaptchaV3Token"] = cached_token
-
-                                async def _try_chrome_fetch() -> Optional[BrowserFetchStreamResponse]:
-                                    debug_print("🌐 Using Chrome fetch transport for streaming...")
-                                    try:
-                                        auth_for_browser = str(current_token or "").strip()
-                                        try:
-                                            cand = str(EPHEMERAL_ARENA_AUTH_TOKEN or "").strip()
-                                        except Exception:
-                                            cand = ""
-                                        if cand:
-                                            try:
-                                                if (
-                                                    is_probably_valid_arena_auth_token(cand)
-                                                    and not is_arena_auth_token_expired(cand, skew_seconds=0)
-                                                    and (
-                                                        (not auth_for_browser)
-                                                        or (not is_probably_valid_arena_auth_token(auth_for_browser))
-                                                        or is_arena_auth_token_expired(auth_for_browser, skew_seconds=0)
-                                                    )
-                                                ):
-                                                    auth_for_browser = cand
-                                            except Exception:
-                                                auth_for_browser = cand
-
-                                        try:
-                                            chrome_outer_timeout = float(get_config().get("chrome_fetch_outer_timeout_seconds", 120))
-                                        except Exception:
-                                            chrome_outer_timeout = 120.0
-                                        chrome_outer_timeout = max(20.0, min(chrome_outer_timeout, 300.0))
-
-                                        return await asyncio.wait_for(
-                                            fetch_lmarena_stream_via_chrome(
-                                                http_method=http_method,
-                                                url=url,
-                                                payload=payload if isinstance(payload, dict) else {},
-                                                auth_token=auth_for_browser,
-                                                timeout_seconds=120,
-                                                max_recaptcha_attempts=browser_fetch_attempts,
-                                            ),
-                                            timeout=chrome_outer_timeout,
-                                        )
-                                    except asyncio.TimeoutError:
-                                        debug_print("⚠️ Chrome fetch transport timed out (launch/nav hang).")
-                                        return None
-                                    except Exception as e:
-                                        debug_print(f"⚠️ Chrome fetch transport error: {e}")
-                                        return None
-
-                                async def _try_camoufox_fetch() -> Optional[BrowserFetchStreamResponse]:
-                                    debug_print("🦊 Using Camoufox fetch transport for streaming...")
-                                    try:
-                                        auth_for_browser = str(current_token or "").strip()
-                                        try:
-                                            cand = str(EPHEMERAL_ARENA_AUTH_TOKEN or "").strip()
-                                        except Exception:
-                                            cand = ""
-                                        if cand:
-                                            try:
-                                                if (
-                                                    is_probably_valid_arena_auth_token(cand)
-                                                    and not is_arena_auth_token_expired(cand, skew_seconds=0)
-                                                    and (
-                                                        (not auth_for_browser)
-                                                        or (not is_probably_valid_arena_auth_token(auth_for_browser))
-                                                        or is_arena_auth_token_expired(auth_for_browser, skew_seconds=0)
-                                                    )
-                                                ):
-                                                    auth_for_browser = cand
-                                            except Exception:
-                                                auth_for_browser = cand
-
-                                        try:
-                                            camoufox_outer_timeout = float(
-                                                get_config().get("camoufox_fetch_outer_timeout_seconds", 180)
-                                            )
-                                        except Exception:
-                                            camoufox_outer_timeout = 180.0
-                                        camoufox_outer_timeout = max(20.0, min(camoufox_outer_timeout, 300.0))
-
-                                        return await asyncio.wait_for(
-                                            fetch_lmarena_stream_via_camoufox(
-                                                http_method=http_method,
-                                                url=url,
-                                                payload=payload if isinstance(payload, dict) else {},
-                                                auth_token=auth_for_browser,
-                                                timeout_seconds=120,
-                                                max_recaptcha_attempts=browser_fetch_attempts,
-                                            ),
-                                            timeout=camoufox_outer_timeout,
-                                        )
-                                    except asyncio.TimeoutError:
-                                        debug_print("⚠️ Camoufox fetch transport timed out (launch/nav hang).")
-                                        return None
-                                    except Exception as e:
-                                        debug_print(f"⚠️ Camoufox fetch transport error: {e}")
-                                        return None
-
-                                if prefer_chrome_transport:
-                                    chrome_task = asyncio.create_task(_try_chrome_fetch())
-                                    while True:
-                                        done, _ = await asyncio.wait({chrome_task}, timeout=1.0)
-                                        if chrome_task in done:
-                                            try:
-                                                stream_context = chrome_task.result()
-                                            except Exception:
-                                                stream_context = None
-                                            break
-                                        yield ": keep-alive\n\n"
-                                    if stream_context is not None:
-                                        transport_used = "chrome"
-                                    if stream_context is None:
-                                        camoufox_task = asyncio.create_task(_try_camoufox_fetch())
-                                        while True:
-                                            done, _ = await asyncio.wait({camoufox_task}, timeout=1.0)
-                                            if camoufox_task in done:
-                                                try:
-                                                    stream_context = camoufox_task.result()
-                                                except Exception:
-                                                    stream_context = None
-                                                break
-                                            yield ": keep-alive\n\n"
-                                        if stream_context is not None:
-                                            transport_used = "camoufox"
-                                else:
-                                    camoufox_task = asyncio.create_task(_try_camoufox_fetch())
-                                    while True:
-                                        done, _ = await asyncio.wait({camoufox_task}, timeout=1.0)
-                                        if camoufox_task in done:
-                                            try:
-                                                stream_context = camoufox_task.result()
-                                            except Exception:
-                                                stream_context = None
-                                            break
-                                        yield ": keep-alive\n\n"
-                                    if stream_context is not None:
-                                        transport_used = "camoufox"
-                                    if stream_context is None:
-                                        chrome_task = asyncio.create_task(_try_chrome_fetch())
-                                        while True:
-                                            done, _ = await asyncio.wait({chrome_task}, timeout=1.0)
-                                            if chrome_task in done:
-                                                try:
-                                                    stream_context = chrome_task.result()
-                                                except Exception:
-                                                    stream_context = None
-                                                break
-                                            yield ": keep-alive\n\n"
-                                        if stream_context is not None:
-                                            transport_used = "chrome"
-
+                            
+                            if stream_context is None:
+                                debug_print("🌐 Using FlareSolverr + httpx transport for streaming...")
+                                stream_context = await fetch_lmarena_stream_via_flaresolverr(
+                                    http_method=http_method,
+                                    url=url,
+                                    payload=payload if isinstance(payload, dict) else {},
+                                    auth_token=current_token,
+                                    timeout_seconds=120,
+                                )
+                                transport_used = "flaresolverr" if stream_context else None
+                                
                             if stream_context is None:
                                 client = await stack.enter_async_context(httpx.AsyncClient())
+
                                 if http_method == "PUT":
                                     stream_context = client.stream('PUT', url, json=payload, headers=headers, timeout=120)
                                 else:
@@ -4154,8 +4092,14 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
                             
                             debug_print(
                                 f"🚫 LMArena API returned 403 (Forbidden). "
-                                f"Retrying with exponential backoff (attempt {current_retry_attempt}/{max_retries})."
+                                f"Rotating proxy and retrying (attempt {current_retry_attempt}/{max_retries})."
                             )
+                            
+                            # Rotate proxy because this is a likely Cloudflare block
+                            rotated = await proxy_manager.rotate_proxy()
+                            if not rotated:
+                                debug_print("⚠️ Proxy rotation failed, will retry with same/no proxy.")
+                            
                             sleep_seconds = get_general_backoff_seconds(current_retry_attempt)
                             async for ka in wait_with_keepalive(sleep_seconds):
                                 yield ka
@@ -4238,70 +4182,21 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         # Handle non-streaming mode with retry
         try:
             response = None
-            if time.time() - last_userscript_poll < 15:
-                debug_print(f"🌐 Userscript Proxy is ACTIVE. Delegating non-streaming request...")
-                response = await fetch_via_proxy_queue(
-                    url=url,
-                    payload=payload if isinstance(payload, dict) else {},
-                    http_method=http_method,
-                    timeout_seconds=120,
-                    auth_token=current_token,
-                )
-                if response:
-                    # Raise for status to trigger the standard error handling block below if needed
-                    response.raise_for_status()
-                else:
-                    debug_print("⚠️ Userscript Proxy returned None. Falling back...")
 
-            if response is None:
-                if use_chrome_fetch_for_model:
-                    debug_print(f"🌐 Using Chrome fetch transport for non-streaming strict model ({model_public_name})...")
-                    # Chrome fetch transport has its own internal reCAPTCHA retries, 
-                    # but we add an outer loop here to handle token rotation (401) and rate limits (429).
-                    max_chrome_retries = 3
-                    for chrome_attempt in range(max_chrome_retries):
-                        response = await fetch_lmarena_stream_via_chrome(
-                            http_method=http_method,
-                            url=url,
-                            payload=payload if isinstance(payload, dict) else {},
-                            auth_token=current_token,
-                            timeout_seconds=120,
-                        )
-                        
-                        if response is None:
-                            debug_print(f"⚠️ Chrome fetch transport failed (attempt {chrome_attempt+1}). Trying Camoufox...")
-                            response = await fetch_lmarena_stream_via_camoufox(
-                                http_method=http_method,
-                                url=url,
-                                payload=payload if isinstance(payload, dict) else {},
-                                auth_token=current_token,
-                                timeout_seconds=120,
-                            )
-                            if response is None:
-                                break # Critical error
-                        
-                        if response.status_code == HTTPStatus.UNAUTHORIZED:
-                            debug_print(f"🔒 Token {current_token[:20]}... expired in Chrome fetch (attempt {chrome_attempt+1})")
-                            failed_tokens.add(current_token)
-                            # (Pruning disabled)
-                            if chrome_attempt < max_chrome_retries - 1:
-                                try:
-                                    current_token = get_next_auth_token(exclude_tokens=failed_tokens)
-                                    debug_print(f"🔄 Rotating to next token: {current_token[:20]}...")
-                                    continue
-                                except HTTPException:
-                                    break
-                        elif response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
-                            debug_print(f"⏱️  Rate limit in Chrome fetch (attempt {chrome_attempt+1})")
-                            if chrome_attempt < max_chrome_retries - 1:
-                                sleep_seconds = get_rate_limit_sleep_seconds(response.headers.get("Retry-After"), chrome_attempt)
-                                await asyncio.sleep(sleep_seconds)
-                                continue
-                        
-                        # If success or non-retryable error, break and use this response
-                        break
-                else:
-                    response = await make_request_with_retry(url, payload, http_method)
+            # FlareSolverr migration: try FlareSolverr + httpx transport first, then plain httpx fallback.
+            debug_print("🌐 Using FlareSolverr + httpx transport for non-streaming request...")
+            response = await fetch_lmarena_stream_via_flaresolverr(
+                http_method=http_method,
+                url=url,
+                payload=payload if isinstance(payload, dict) else {},
+                auth_token=current_token,
+                timeout_seconds=120,
+            )
+            if response:
+                response.raise_for_status()
+            else:
+                debug_print("⚠️ FlareSolverr transport returned None. Falling back to direct httpx...")
+                response = await make_request_with_retry(url, payload, http_method)
             
             if response is None:
                 debug_print("⚠️ Browser transports returned None; falling back to direct httpx.")

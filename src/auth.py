@@ -21,8 +21,8 @@ import json
 import re
 import time
 from typing import Optional
-
 import httpx
+from curl_cffi import requests as cffi_requests
 from fastapi import HTTPException
 
 
@@ -205,8 +205,8 @@ def get_request_headers_with_token(token: str, recaptcha_v3_token: Optional[str]
     headers: dict[str, str] = {
         "Content-Type": "text/plain;charset=UTF-8",
         "Cookie": "; ".join(cookie_parts),
-        "Origin": "https://lmarena.ai",
-        "Referer": "https://lmarena.ai/?mode=direct",
+        "Origin": "https://arena.ai",
+        "Referer": "https://arena.ai/?mode=direct",
     }
 
     user_agent = normalize_user_agent_value(config.get("user_agent"))
@@ -478,7 +478,7 @@ async def refresh_arena_auth_token_via_lmarena_http(old_token: str, config: Opti
     LMArena appears to refresh Supabase session cookies server-side when you request a page with an expired session
     cookie (it rotates refresh tokens and returns a new `arena-auth-prod-v1` via Set-Cookie).
 
-    This avoids needing the Supabase anon key locally and keeps the bridge working even after `expires_at` passes.
+    This uses `curl_cffi` to impersonate Chrome TLS fingerprints and bypass Cloudflare blocks on HTTP requests.
     """
     old_token = str(old_token or "").strip()
     if not old_token or not old_token.startswith("base64-"):
@@ -519,20 +519,34 @@ async def refresh_arena_auth_token_via_lmarena_http(old_token: str, config: Opti
     cookies["arena-auth-prod-v1"] = old_token
 
     try:
-        async with httpx.AsyncClient(
+        async with cffi_requests.AsyncSession(
+            impersonate="firefox133",
             headers={"User-Agent": ua},
-            follow_redirects=True,
-            timeout=httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0),
+            timeout=15.0,
         ) as client:
-            resp = await client.get("https://lmarena.ai/", cookies=cookies)
-    except Exception:
+            resp = await client.get("https://arena.ai/", cookies=cookies)
+    except Exception as e:
+        _m().debug_print(f"❌ Failed to reach arena.ai for token refresh: {e}")
         return None
 
     try:
-        set_cookie_headers = resp.headers.get_list("set-cookie")
+        # curl_cffi uses .headers which acts like a dict, need to get all set-cookie raw headers if possible
+        # Alternatively we can inspect resp.cookies since cffi handles parsing
+        for cookie in resp.cookies:
+            if cookie.name == "arena-auth-prod-v1":
+                new_value = cookie.value
+                if is_probably_valid_arena_auth_token(new_value) and not is_arena_auth_token_expired(new_value, skew_seconds=0):
+                    return new_value
     except Exception:
-        raw = resp.headers.get("set-cookie")
-        set_cookie_headers = [raw] if raw else []
+        pass
+        
+    try:
+        # Fallback to manual parsing just in case
+        set_cookie_headers = resp.headers.get("set-cookie", "")
+        if isinstance(set_cookie_headers, str):
+            set_cookie_headers = [set_cookie_headers]
+    except Exception:
+        set_cookie_headers = []
 
     for sc in set_cookie_headers or []:
         if not isinstance(sc, str) or not sc:

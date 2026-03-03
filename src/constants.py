@@ -160,7 +160,7 @@ STATUS_MESSAGES = {
 
 # Default reCAPTCHA sitekey and action from gpt4free/g4f/Provider/needs_auth/LMArena.py
 RECAPTCHA_SITEKEY = "6Led_uYrAAAAAKjxDIF58fgFtX3t8loNAK85bW9I"
-RECAPTCHA_ACTION = "chat_submit"
+RECAPTCHA_ACTION = "sign_up"
 
 # reCAPTCHA Enterprise v2 sitekey used when v3 scoring fails and LMArena prompts a checkbox challenge
 RECAPTCHA_V2_SITEKEY = "6Ld7ePYrAAAAAB34ovoFoDau1fqCJ6IyOjFEQaMn"
@@ -172,8 +172,16 @@ TURNSTILE_SITEKEY = "0x4AAAAAAA65vWDmG-O_lPtT"
 # ARENA ORIGINS
 # ============================================================
 
-LMARENA_ORIGIN = "https://lmarena.ai"
+LMARENA_ORIGIN = "https://arena.ai"
 ARENA_ORIGIN = "https://arena.ai"
+
+# Hardcoded origins allowing CORS requests. Add custom origins if integrating a frontend.
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "https://arena.ai",
+    "https://www.arena.ai",
+]
 
 ARENA_HOST_TO_ORIGIN = {
     "lmarena.ai": LMARENA_ORIGIN,
@@ -309,7 +317,7 @@ ARENA_COOKIE_DOMAINS = (".lmarena.ai", ".arena.ai")
 # API ENDPOINTS
 # ============================================================
 
-ARENA_DIRECT_MODE_URL = "https://lmarena.ai/?mode=direct"
+ARENA_DIRECT_MODE_URL = "https://arena.ai/?mode=direct"
 NEXTJS_API_SIGNUP = "/nextjs-api/sign-up"
 
 # ============================================================
@@ -341,8 +349,8 @@ TURNSTILE_INNER_SELECTORS = [
 # HTTP HEADERS
 # ============================================================
 
-ARENA_ORIGIN_HEADER = "https://lmarena.ai"
-ARENA_REFERER_HEADER = "https://lmarena.ai/?mode=direct"
+ARENA_ORIGIN_HEADER = "https://arena.ai"
+ARENA_REFERER_HEADER = "https://arena.ai/?mode=direct"
 
 # ============================================================
 # SUPABASE

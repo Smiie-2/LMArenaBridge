@@ -24,8 +24,6 @@ classifiers = [
 dependencies = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
-    "camoufox",
-    "playwright",
     "httpx",
     "python-multipart",
 ]
